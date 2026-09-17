@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.gabbe2312.omabeam",
+  "name": "Omabeam",
+  "version": "1.0.0",
+  "author": "Gabbe2312",
+  "license": "MIT",
+  "description": "Lightbeam for the whole machine. A living graph of every process with a socket open and every remote host on the far end of one, plus every service that has your e-mail address, read from the mailbox itself.",
+  "homepage": "https://github.com/Gabbe2312/omabeam",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omabeam",
+    "description": "See everything this machine is connected to, as a graph",
+    "category": "Network",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

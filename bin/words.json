@@ -1,0 +1,167 @@
+{
+  "_about": "Word lists for omabeam-mail. Regular expressions are Python syntax, matched case-insensitively against the subject line. Edit freely; run the tests afterwards.",
+  "alert": "security|sikkerhet|new sign.?in|ny (innlogging|pålogging|enhet)|unusual|suspicious|mistenkelig|password (was |has been )?(changed|reset)|passord\\w* (er |ble )?(endret|tilbakestilt)|verification code|bekreftelseskode|your (login |sign.?in )?code|din kode|engangskode|one.?time|two.?factor|2fa|login attempt|was granted access|has access to your|tilgang til|new device|unrecognized|signed in|access from|new (computer|browser|location)|logged in from",
+  "account": "verify|verifiser|confirm|bekreft|welcome|velkommen|activate|aktiver|create[d]? (your |an )?account|(your|new) account|din konto|kontoen din|brukerkonto|password|passord|sign.?up|registrer|registration|reset|tilbakestill|getting started|kom i gang|complete your|fullfør|thanks for (joining|signing)",
+  "receipt": "receipt|kvittering|\\border\\b|ordre|bestilling|bestellung|invoice|faktura|rechnung|payment|betaling|purchase|kjøp|subscription|abonnement|renew|forny|shipped|shipment|sendt|delivery|levering|leveres|booking|reservation|reservasjon|ticket|billett|refund|refusjon|charged|belastet|trial|prøveperiode|your plan|receipt from|confirmation of|ordrebekreftelse",
+  "newsletter": "newsletter|nyhetsbrev|unsubscribe|% ?off|% ?rabatt|sale\\b|salg\\b|tilbud|deal|this week|denne uken|digest|roundup|what's new|nyheter",
+  "verify": "verify|verifiser|verifikasjon|verification|bekreft (?:e-?post|adressen|kontoen|din e-?post)|confirm your (?:e-?mail|address|account|registration)|activate your|aktiver kontoen|set (?:your|a) password|choose (?:your|a) password|velg (?:et )?passord|opprett (?:et )?passord|bekreftelseslenke|complete your registration|fullf.r registreringen|finish signing up",
+  "automated_sender": "^(no.?reply|donotreply|do.?not.?reply|noreply|notification|notifications|notify|mailer|alerts?|news|newsletter|info|support|hello|hi|team|billing|receipts?|orders?|service|account|accounts|security|verify|welcome|updates?|marketing|help|contact|customer|community|digest|store|shop|sales|admin|system|bot|automated|auto|mail|email|post|kundeservice|kvittering|ordre|ikke-svar|ikkesvar|ingen-svar)",
+  "freemail": [
+    "altibox.no",
+    "aol.com",
+    "broadpark.no",
+    "c2i.net",
+    "fastmail.com",
+    "frisurf.no",
+    "getmail.no",
+    "gmail.com",
+    "gmx.com",
+    "gmx.de",
+    "googlemail.com",
+    "hotmail.co.uk",
+    "hotmail.com",
+    "hotmail.no",
+    "icloud.com",
+    "live.com",
+    "live.no",
+    "lyse.net",
+    "mac.com",
+    "mail.com",
+    "me.com",
+    "msn.com",
+    "online.no",
+    "outlook.com",
+    "outlook.de",
+    "pm.me",
+    "proton.me",
+    "protonmail.com",
+    "start.no",
+    "telenor.no",
+    "telia.no",
+    "web.de",
+    "yahoo.co.uk",
+    "yahoo.com",
+    "yahoo.no"
+  ],
+  "families": {
+    "Google": [
+      "google.com",
+      "gmail.com",
+      "googlemail.com",
+      "youtube.com",
+      "google.no",
+      "accounts.google.com",
+      "googleplay.com",
+      "firebase.com",
+      "withgoogle.com"
+    ],
+    "Meta": [
+      "facebook.com",
+      "facebookmail.com",
+      "instagram.com",
+      "meta.com",
+      "whatsapp.com",
+      "messenger.com",
+      "threads.net",
+      "oculus.com"
+    ],
+    "Microsoft": [
+      "microsoft.com",
+      "live.com",
+      "outlook.com",
+      "hotmail.com",
+      "xbox.com",
+      "office.com",
+      "azure.com",
+      "microsoftonline.com",
+      "skype.com"
+    ],
+    "Apple": [
+      "apple.com",
+      "icloud.com",
+      "itunes.com",
+      "me.com",
+      "mac.com",
+      "appleid.com"
+    ],
+    "Amazon": [
+      "amazon.com",
+      "amazon.de",
+      "amazon.co.uk",
+      "amazon.se",
+      "amazon.nl",
+      "amazon.fr",
+      "amazonses.com",
+      "audible.com",
+      "twitch.tv",
+      "aws.com",
+      "amazonaws.com"
+    ],
+    "Adobe": [
+      "adobe.com",
+      "behance.net"
+    ],
+    "Discord": [
+      "discord.com",
+      "discordapp.com"
+    ],
+    "GitHub": [
+      "github.com",
+      "githubusercontent.com"
+    ],
+    "Spotify": [
+      "spotify.com",
+      "spotifymail.com"
+    ],
+    "PayPal": [
+      "paypal.com",
+      "paypal.no"
+    ],
+    "Steam": [
+      "steampowered.com",
+      "valvesoftware.com"
+    ],
+    "Nintendo": [
+      "nintendo.com",
+      "nintendo.net",
+      "nintendo.co.uk"
+    ],
+    "Sony": [
+      "sony.com",
+      "playstation.com",
+      "sonyentertainmentnetwork.com"
+    ],
+    "Vipps": [
+      "vipps.no",
+      "vippsmobilepay.com"
+    ],
+    "Reddit": [
+      "reddit.com",
+      "redditmail.com"
+    ],
+    "LinkedIn": [
+      "linkedin.com",
+      "linkedinmail.com"
+    ],
+    "X": [
+      "x.com",
+      "twitter.com"
+    ],
+    "Telegram": [
+      "telegram.org",
+      "telegram.me"
+    ],
+    "Epic Games": [
+      "epicgames.com",
+      "unrealengine.com"
+    ],
+    "Ubisoft": [
+      "ubisoft.com",
+      "ubi.com"
+    ],
+    "EA": [
+      "ea.com",
+      "e.ea.com"
+    ]
+  }
+}

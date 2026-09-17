@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+"""Omabeam - who this machine is talking to, as a graph.
+
+Lightbeam did this for a browser: every site you visited, every third party
+those sites quietly pulled in, drawn as a web that grew while you browsed. This
+does it for the whole machine. Every process with an open socket, every remote
+address on the far end of one, accumulated for as long as the session runs, so
+the picture is not "what is connected right now" but "everything this machine
+has reached out to since you last looked".
+
+The QML side never touches the network. It runs this script and reads JSON:
+
+  snapshot   read the socket table once, fold it into the session, print it
+  lookup     resolve names and owners for addresses that still lack them
+  reset      forget the session
+  dnswatch   follow the resolver and remember which name each address answered to
+  trackers   fetch the EasyPrivacy tracker domains (once a week is plenty)
+
+Reverse DNS rarely says what a host is for -- a Google analytics endpoint
+answers to 1e100.net. The name the machine actually asked for does, so
+`dnswatch` listens to systemd-resolved and keeps address -> queried name.
+That name is what `trackers` is matched against.
+
+Names come from reverse DNS and, for Tailscale peers, from tailscale itself.
+Owners come from Team Cymru's IP-to-ASN service, which is one bulk whois
+query per batch of new addresses -- that is the only outbound traffic this
+plugin generates, and it is off with `--no-owners`.
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy" / "omabeam"
+SESSION_FILE = CACHE_DIR / "session.json"
+NAMES_FILE = CACHE_DIR / "names.json"
+DNS_FILE = CACHE_DIR / "dns.json"
+TRACKERS_FILE = CACHE_DIR / "trackers.json"
+
+# EasyPrivacy is the trackers proper; EasyList is the ad networks, which in
+# the Lightbeam sense are the same thing: third parties that see you.
+TRACKER_LISTS = [
+    "https://easylist.to/easylist/easyprivacy.txt",
+    "https://easylist.to/easylist/easylist.txt",
+]
+TRACKERS_MAX_AGE = 7 * 86400
+DNS_MAX_ENTRIES = 4000
+
+LOOKUP_BATCH = 24
+LOOKUP_RETRY_SECONDS = 300
+LOOKUP_MAX_TRIES = 3
+CYMRU_HOST = "whois.cymru.com"
+CYMRU_PORT = 43
+
+USERS_RE = re.compile(r'\("([^"]*)",pid=(\d+),fd=\d+\)')
+
+
+def die(message, code=1):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+# ---------------------------------------------------------------- json files
+
+def read_json(path, fallback):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+    return data if isinstance(data, dict) else fallback
+
+
+def write_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=1)
+        handle.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------- address kinds
+
+def parse_ip(text):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    # ss prints the interface on link-local and DHCP sockets: 10.0.0.49%enp5s0
+    text = text.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return addr
+
+
+TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+
+def kind_of(addr):
+    """internet | lan | tailscale, or None for addresses that are not a peer."""
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
+        return None
+    if addr in TAILSCALE_V4 or addr in TAILSCALE_V6:
+        return "tailscale"
+    if addr.is_private:
+        return "lan"
+    return "internet"
+
+
+def split_endpoint(text):
+    """'10.0.0.49:443' / '[2001:db8::1]:443' / '*:*' -> (ip or None, port)."""
+    text = text.strip()
+    if text in ("*", "*:*", "0.0.0.0:*", "[::]:*"):
+        return None, 0
+    host, _, port = text.rpartition(":")
+    try:
+        port = int(port)
+    except ValueError:
+        port = 0
+    return parse_ip(host), port
+
+
+# ------------------------------------------------------------- socket table
+
+def read_sockets():
+    """One row per open socket with a concrete peer: (proto, peer ip, port, proc, pid)."""
+    try:
+        out = subprocess.run(
+            ["ss", "-tunpH"], capture_output=True, text=True, timeout=5, check=False
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as error:
+        die("could not run ss: %s" % error)
+
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        proto, state, local, peer = parts[0], parts[1], parts[4], parts[5]
+        if proto not in ("tcp", "udp"):
+            continue
+        # Established only. Half-open attempts would put every address a port
+        # scan ever touched on the graph, and the shutting-down states would
+        # keep dead peers alive for minutes.
+        if proto == "tcp" and state != "ESTAB":
+            continue
+        peer_ip, peer_port = split_endpoint(peer)
+        local_ip, local_port = split_endpoint(local)
+        if peer_ip is None:
+            continue
+        if local_ip is not None and peer_ip == local_ip:
+            continue
+        if kind_of(peer_ip) is None:
+            continue
+        users = USERS_RE.findall(line)
+        if users:
+            for name, pid in users:
+                rows.append((proto, peer_ip, peer_port, name or "?", int(pid)))
+        else:
+            # Sockets owned by other users -- tailscaled, systemd-resolved,
+            # a DHCP client -- show up with no process unless we are root.
+            rows.append((proto, peer_ip, peer_port, "system", 0))
+    return rows
+
+
+# ----------------------------------------------------------------- session
+
+def empty_session():
+    return {"startedAt": time.time(), "hosts": {}, "edges": {}, "procs": {}}
+
+
+def load_session():
+    session = read_json(SESSION_FILE, None)
+    if not session or not isinstance(session.get("hosts"), dict):
+        return empty_session()
+    session.setdefault("edges", {})
+    session.setdefault("procs", {})
+    return session
+
+
+def fold(session, rows, now, forget_after):
+    """Merge one socket table reading into the running session."""
+    hosts, edges, procs = session["hosts"], session["edges"], session["procs"]
+    live_hosts, live_edges, live_procs = set(), set(), set()
+
+    for proto, ip, port, proc, pid in rows:
+        key = str(ip)
+        host = hosts.get(key)
+        if host is None:
+            host = hosts[key] = {
+                "ip": key, "kind": kind_of(ip), "firstSeen": now, "lastSeen": now,
+                "ports": {}, "procs": {}, "peakConns": 0,
+            }
+        host["lastSeen"] = now
+        host["ports"][str(port)] = host["ports"].get(str(port), 0) + 1
+        host["procs"][proc] = host["procs"].get(proc, 0) + 1
+        live_hosts.add(key)
+
+        edge_key = proc + "|" + key
+        edge = edges.get(edge_key)
+        if edge is None:
+            edge = edges[edge_key] = {"proc": proc, "host": key, "firstSeen": now, "lastSeen": now, "conns": 0, "proto": {}}
+        edge["lastSeen"] = now
+        edge["proto"][proto] = edge["proto"].get(proto, 0) + 1
+        live_edges.add(edge_key)
+
+        entry = procs.get(proc)
+        if entry is None:
+            entry = procs[proc] = {"name": proc, "firstSeen": now, "lastSeen": now, "pids": []}
+        entry["lastSeen"] = now
+        if pid and pid not in entry["pids"]:
+            entry["pids"] = (entry["pids"] + [pid])[-8:]
+        live_procs.add(proc)
+
+    # Live connection counts are per reading, not cumulative: the ports and
+    # procs tallies above accumulate, `conns` describes right now.
+    counts = {}
+    edge_counts = {}
+    for proto, ip, port, proc, pid in rows:
+        counts[str(ip)] = counts.get(str(ip), 0) + 1
+        edge_counts[proc + "|" + str(ip)] = edge_counts.get(proc + "|" + str(ip), 0) + 1
+    for key, host in hosts.items():
+        host["conns"] = counts.get(key, 0)
+        host["peakConns"] = max(host.get("peakConns", 0), host["conns"])
+        host["live"] = key in live_hosts
+    for key, edge in edges.items():
+        edge["conns"] = edge_counts.get(key, 0)
+        edge["live"] = key in live_edges
+    for key, entry in procs.items():
+        entry["live"] = key in live_procs
+
+    # A peer that has been quiet for long enough drops off, so the graph is a
+    # recent history rather than an ever-growing archive.
+    if forget_after > 0:
+        for key in [k for k, h in hosts.items() if not h["live"] and now - h["lastSeen"] > forget_after]:
+            del hosts[key]
+        for key in [k for k, e in edges.items() if e["host"] not in hosts]:
+            del edges[key]
+        used = {e["proc"] for e in edges.values()}
+        for key in [k for k in procs if k not in used]:
+            del procs[key]
+
+
+# ------------------------------------------------------------------ naming
+
+def load_names():
+    return read_json(NAMES_FILE, {})
+
+
+def needs_lookup(entry, now):
+    if entry is None:
+        return True
+    if entry.get("done"):
+        return False
+    if entry.get("tries", 0) >= LOOKUP_MAX_TRIES:
+        return False
+    return now - entry.get("at", 0) > LOOKUP_RETRY_SECONDS
+
+
+def tailscale_names():
+    """Tailscale IP -> peer hostname, from tailscale itself. Empty if not running."""
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"], capture_output=True, text=True, timeout=4, check=False
+        ).stdout
+        status = json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+    names = {}
+    peers = list((status.get("Peer") or {}).values())
+    if status.get("Self"):
+        peers.append(status["Self"])
+    for peer in peers:
+        name = peer.get("HostName") or (peer.get("DNSName") or "").rstrip(".").split(".")[0]
+        for ip in peer.get("TailscaleIPs") or []:
+            names[ip] = name
+    return names
+
+
+def reverse_dns(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0].rstrip(".")
+    except (OSError, UnicodeError):
+        return ""
+
+
+def cymru_owners(ips):
+    """{ip: (owner, country)} from one bulk whois query. Empty on any failure."""
+    if not ips:
+        return {}
+    query = "begin\nverbose\n" + "\n".join(ips) + "\nend\n"
+    try:
+        with socket.create_connection((CYMRU_HOST, CYMRU_PORT), timeout=6) as sock:
+            sock.sendall(query.encode())
+            chunks = []
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+    except OSError:
+        return {}
+    owners = {}
+    for line in b"".join(chunks).decode("utf-8", "replace").splitlines():
+        fields = [f.strip() for f in line.split("|")]
+        if len(fields) < 7 or not fields[0].isdigit():
+            continue
+        ip, country, as_name = fields[1], fields[3], fields[6]
+        owners[ip] = (pretty_owner(as_name), country if country != "NA" else "")
+    return owners
+
+
+def pretty_owner(as_name):
+    """'GOOGLE-CLOUD-PLATFORM - Google LLC, US' -> 'Google LLC'."""
+    text = as_name.strip()
+    if " - " in text:
+        text = text.split(" - ", 1)[1]
+    text = re.sub(r",\s*[A-Z]{2}$", "", text)
+    text = re.sub(r"\b(Inc\.?|LLC|Ltd\.?|PBC|GmbH|S\.A\.|Co\.?,? Ltd\.?|B\.V\.|AG|SAS)\s*$", "", text.rstrip(",. ")).rstrip(",. ")
+    return text or as_name.strip()
+
+
+def run_lookup(want_owners):
+    now = time.time()
+    session = load_session()
+    names = load_names()
+    pending = [ip for ip in session["hosts"] if needs_lookup(names.get(ip), now)]
+    pending.sort(key=lambda ip: -session["hosts"][ip].get("conns", 0))
+    pending = pending[:LOOKUP_BATCH]
+    if not pending:
+        print(json.dumps({"resolved": 0}))
+        return
+
+    ts_names = tailscale_names() if any(session["hosts"][ip]["kind"] == "tailscale" for ip in pending) else {}
+    socket.setdefaulttimeout(2)
+    rdns = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(reverse_dns, ip): ip for ip in pending}
+        for future in as_completed(futures, timeout=8):
+            try:
+                rdns[futures[future]] = future.result()
+            except Exception:
+                rdns[futures[future]] = ""
+
+    public = [ip for ip in pending if session["hosts"][ip]["kind"] == "internet"]
+    owners = cymru_owners(public) if want_owners else {}
+
+    resolved = 0
+    for ip in pending:
+        previous = names.get(ip) or {}
+        entry = {
+            "name": ts_names.get(ip) or rdns.get(ip) or previous.get("name", ""),
+            "owner": owners.get(ip, ("", ""))[0] or previous.get("owner", ""),
+            "country": owners.get(ip, ("", ""))[1] or previous.get("country", ""),
+            "at": now,
+            "tries": previous.get("tries", 0) + 1,
+        }
+        kind = session["hosts"][ip]["kind"]
+        wants_owner = want_owners and kind == "internet"
+        entry["done"] = bool(entry["name"]) and (not wants_owner or bool(entry["owner"]))
+        if entry["name"] or entry["owner"]:
+            resolved += 1
+        names[ip] = entry
+    write_json(NAMES_FILE, names)
+    print(json.dumps({"resolved": resolved, "pending": len(pending)}))
+
+
+# --------------------------------------------------------------- dns names
+
+def run_dnswatch():
+    """Follow systemd-resolved and keep the name each address was asked for.
+
+    Runs until killed. Writes the map at most every two seconds, so a busy
+    browser does not turn into a busy disk.
+    """
+    # Subscribing to the resolver is a polkit action (auth_admin), and
+    # resolvectl asked without an agent simply sits there forever. Ask polkit
+    # first, without interaction, and say plainly what is missing.
+    try:
+        check = subprocess.run(
+            ["pkcheck", "--action-id", POLKIT_ACTION, "--process", str(os.getpid())],
+            capture_output=True, text=True, timeout=10,
+        )
+        authorised = check.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        authorised = False
+    if not authorised:
+        print("not allowed to watch the resolver. Install the polkit rule: "
+              "omabeam dns-rule | sudo tee /etc/polkit-1/rules.d/50-omabeam-dns.rules", file=sys.stderr)
+        raise SystemExit(3)
+
+    # resolvectl block-buffers when its stdout is a pipe, and the shell's
+    # SIGTERM at shutdown would lose whatever was sitting in that buffer.
+    # Line-buffer it, and turn the signal into an exception so the map is
+    # flushed on the way out.
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        proc = subprocess.Popen(
+            ["stdbuf", "-oL", "resolvectl", "monitor", "--json=short"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+    except OSError as error:
+        die("could not start resolvectl monitor: %s" % error)
+    names = read_json(DNS_FILE, {})
+    dirty = False
+    last_write = 0.0
+    try:
+        for line in proc.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            now = time.time()
+            for answer in event.get("answer") or []:
+                rr = answer.get("rr") or {}
+                addr = rr.get("address")
+                name = ((rr.get("key") or {}).get("name") or "").rstrip(".").lower()
+                if not addr or not name:
+                    continue
+                try:
+                    ip = str(ipaddress.ip_address(bytes(addr)))
+                except (ValueError, TypeError):
+                    continue
+                # The name the program asked for is what matters, not the
+                # CNAME the answer finally landed on -- fall back to the
+                # record name only when the question is missing.
+                asked = ""
+                for question in event.get("question") or []:
+                    asked = (question.get("name") or "").rstrip(".").lower()
+                    if asked:
+                        break
+                names[ip] = {"name": asked or name, "at": now}
+                dirty = True
+            if dirty and now - last_write > 2:
+                if len(names) > DNS_MAX_ENTRIES:
+                    oldest = sorted(names.items(), key=lambda kv: kv[1].get("at", 0))
+                    for key, _ in oldest[: len(names) - DNS_MAX_ENTRIES]:
+                        del names[key]
+                write_json(DNS_FILE, names)
+                dirty = False
+                last_write = now
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if dirty:
+            write_json(DNS_FILE, names)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
+POLKIT_ACTION = "org.freedesktop.resolve1.subscribe-query-results"
+
+
+def run_dns_rule():
+    """A polkit rule letting this user follow the resolver without a prompt."""
+    import getpass
+    user = getpass.getuser()
+    print("""// Omabeam: let %s follow systemd-resolved's query stream, so the machine
+// graph can name hosts by the name that was actually asked for. Read-only;
+// it reveals nothing that `resolvectl monitor` would not show interactively.
+polkit.addRule(function(action, subject) {
+  if (action.id == "%s" && subject.user == "%s" && subject.active) {
+    return polkit.Result.YES;
+  }
+});""" % (user, POLKIT_ACTION, user))
+
+
+def run_trackers(force):
+    """The EasyPrivacy domain rules, as a plain set of domains."""
+    current = read_json(TRACKERS_FILE, {})
+    if not force and time.time() - current.get("at", 0) < TRACKERS_MAX_AGE and current.get("domains"):
+        print(json.dumps({"domains": len(current["domains"]), "fresh": True}))
+        return
+    import urllib.request
+    domains = set()
+    # A whole-domain rule, with or without options: ||name^ or ||name^$...
+    # Path rules (||name/x.js) are left out; they would drag google.com in.
+    rule = re.compile(r"^\|\|([a-z0-9][a-z0-9.-]*\.[a-z]{2,})\^(\$.*)?$")
+    for url in TRACKER_LISTS:
+        try:
+            # The list's host refuses Python's default agent string.
+            request = urllib.request.Request(url, headers={"User-Agent": "omabeam/1.0 (+https://github.com/Gabbe2312/omabeam)"})
+            with urllib.request.urlopen(request, timeout=30) as response:
+                text = response.read().decode("utf-8", "replace")
+        except Exception as error:
+            die("could not fetch %s: %s" % (url, error))
+        for line in text.splitlines():
+            found = rule.match(line.strip())
+            if not found:
+                continue
+            options = found.group(2) or ""
+            # A rule that only applies on certain sites ($domain=a|b) or only
+            # first-party is about a page, not about the host: skip those, or
+            # amazonaws.com ends up ringed because one site abuses it. A
+            # negated list ($domain=~facebook.com) is the opposite -- it
+            # applies everywhere else -- and stays.
+            if "~third-party" in options:
+                continue
+            restricted = re.search(r"domain=([^,]+)", options)
+            if restricted and any(not d.startswith("~") for d in restricted.group(1).split("|")):
+                continue
+            domains.add(found.group(1))
+    if not domains:
+        die("the lists came back with no domain rules")
+    write_json(TRACKERS_FILE, {"at": time.time(), "sources": TRACKER_LISTS, "domains": sorted(domains)})
+    print(json.dumps({"domains": len(domains), "fresh": False}))
+
+
+def load_trackers():
+    return set(read_json(TRACKERS_FILE, {}).get("domains") or [])
+
+
+def is_tracker(name, trackers):
+    """True when the name or any parent of it is on the list."""
+    labels = (name or "").lower().strip(".").split(".")
+    for i in range(len(labels) - 1):
+        if ".".join(labels[i:]) in trackers:
+            return True
+    return False
+
+
+# --------------------------------------------------------------- snapshot
+
+GENERIC_SECOND_LEVEL = {"co", "com", "net", "org", "ac", "gov", "edu", "or", "ne"}
+
+
+def base_domain(name):
+    labels = name.lower().split(".")
+    if len(labels) < 2:
+        return name
+    if len(labels) >= 3 and labels[-2] in GENERIC_SECOND_LEVEL and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+# Owners that host other people's services. Behind these the reverse name says
+# more about who you are really talking to than the network does: a
+# "lb.fra.tailscale.com" on Amazon's address space is Tailscale, not Amazon.
+HOSTING_OWNERS = re.compile(
+    r"amazon|aws|google|cloudflare|fastly|akamai|microsoft|azure|hetzner|digitalocean|"
+    r"ovh|linode|vultr|scaleway|netactuate|equinix|leaseweb|oracle|alibaba|tencent|"
+    r"edgecast|limelight|stackpath|bunny|cdn77|gcore|servers\.com|packet|latitude|"
+    r"upcloud|contabo|ionos|godaddy|rackspace|softlayer|ibm", re.IGNORECASE)
+
+OWNER_ALIASES = {
+    "amazon.com": "Amazon",
+    "google cloud platform": "Google",
+    "google llc": "Google",
+    "microsoft corporation": "Microsoft",
+    "cloudflare": "Cloudflare",
+    "akamai technologies": "Akamai",
+    "facebook": "Meta",
+}
+
+
+def display_owner(owner):
+    return OWNER_ALIASES.get(owner.lower(), owner)
+
+
+def group_of(host, entry):
+    """What node a host belongs to in the grouped view."""
+    kind = host["kind"]
+    name = (entry or {}).get("name", "")
+    owner = display_owner((entry or {}).get("owner", ""))
+    if kind == "internet":
+        if name and (not owner or HOSTING_OWNERS.search(owner)):
+            return base_domain(name)
+        if owner:
+            return owner
+        return host["ip"]
+    # Machines on the LAN or the tailnet are individuals, never merged.
+    return name or host["ip"]
+
+
+def run_snapshot(forget_after, want_owners):
+    now = time.time()
+    session = load_session()
+    fold(session, read_sockets(), now, forget_after)
+    write_json(SESSION_FILE, session)
+
+    names = load_names()
+    dns = read_json(DNS_FILE, {})
+    trackers = load_trackers()
+    hosts = []
+    pending = 0
+    tracker_count = 0
+    for ip, host in session["hosts"].items():
+        entry = names.get(ip)
+        if needs_lookup(entry, now):
+            pending += 1
+        entry = entry or {}
+        # The name this machine asked for beats whatever reverse DNS says.
+        asked = (dns.get(ip) or {}).get("name", "")
+        shown = asked or entry.get("name", "")
+        tracker = bool(trackers) and (is_tracker(asked, trackers) or is_tracker(entry.get("name", ""), trackers))
+        if tracker:
+            tracker_count += 1
+        if asked:
+            entry = dict(entry, name=asked)
+        hosts.append({
+            "ip": ip,
+            "kind": host["kind"],
+            "name": shown,
+            "asked": asked,
+            "tracker": tracker,
+            "owner": display_owner(entry.get("owner", "")) if want_owners else "",
+            "country": entry.get("country", "") if want_owners else "",
+            "group": group_of(host, entry if want_owners else {"name": entry.get("name", "")}),
+            "ports": sorted((int(p) for p in host["ports"]), key=lambda p: -host["ports"][str(p)])[:8],
+            "procs": sorted(host["procs"], key=lambda p: -host["procs"][p]),
+            "conns": host["conns"],
+            "peakConns": host.get("peakConns", host["conns"]),
+            "live": host["live"],
+            "firstSeen": host["firstSeen"],
+            "lastSeen": host["lastSeen"],
+        })
+    hosts.sort(key=lambda h: (-h["live"], -h["conns"], h["group"]))
+
+    edges = [
+        {"proc": e["proc"], "host": e["host"], "conns": e["conns"], "live": e["live"],
+         "proto": sorted(e["proto"], key=lambda p: -e["proto"][p]), "firstSeen": e["firstSeen"]}
+        for e in session["edges"].values()
+    ]
+    procs = [
+        {"name": p["name"], "live": p["live"], "pids": p["pids"], "firstSeen": p["firstSeen"]}
+        for p in session["procs"].values()
+    ]
+
+    print(json.dumps({
+        "at": now,
+        "startedAt": session["startedAt"],
+        "hostname": socket.gethostname(),
+        "hosts": hosts,
+        "edges": edges,
+        "procs": procs,
+        "pending": pending,
+        "trackers": tracker_count,
+        "trackerList": bool(trackers),
+        "liveHosts": sum(1 for h in hosts if h["live"]),
+        "liveConns": sum(h["conns"] for h in hosts),
+    }))
+
+
+def run_reset():
+    try:
+        SESSION_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    print(json.dumps({"ok": True}))
+
+
+# ------------------------------------------------------------------- main
+
+def main():
+    parser = argparse.ArgumentParser(prog="omabeam", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    snap = sub.add_parser("snapshot", help="read the socket table once and print the session")
+    snap.add_argument("--forget-after", type=float, default=600, help="seconds a quiet peer stays on the graph (0 = forever)")
+    snap.add_argument("--no-owners", action="store_true", help="never show or ask for network owners")
+
+    look = sub.add_parser("lookup", help="resolve names and owners for unnamed addresses")
+    look.add_argument("--no-owners", action="store_true", help="skip the owner lookup (no traffic leaves the machine)")
+
+    sub.add_parser("reset", help="forget the session")
+    sub.add_parser("dnswatch", help="follow the resolver; runs until killed")
+    sub.add_parser("dns-rule", help="print the polkit rule that lets dnswatch run without a prompt")
+    tr = sub.add_parser("trackers", help="fetch the EasyPrivacy tracker domains")
+    tr.add_argument("--force", action="store_true", help="fetch even if the cached list is fresh")
+
+    args = parser.parse_args()
+    if args.command == "snapshot":
+        run_snapshot(args.forget_after, not args.no_owners)
+    elif args.command == "lookup":
+        run_lookup(not args.no_owners)
+    elif args.command == "reset":
+        run_reset()
+    elif args.command == "dnswatch":
+        run_dnswatch()
+    elif args.command == "dns-rule":
+        run_dns_rule()
+    elif args.command == "trackers":
+        run_trackers(args.force)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1325 @@
+#!/usr/bin/env python3
+"""Omabeam footprint - every service that has your e-mail address.
+
+Anything that has your address has written to it: "Welcome to", "Verify your
+e-mail", "Your receipt", "Your password was changed", and after that the
+newsletters. So the inbox is the most complete record there is of which
+services know you. This reads the headers -- sender, subject, date, and
+whether there is an unsubscribe link -- never the bodies, groups them by
+sender, and sorts each into accounts, purchases, alerts and newsletters.
+
+  login <address>   read an app password on stdin, test it, keep it in the keyring
+  logout            forget the mailbox
+  status            what is configured and when it was last read
+  sync              read new headers (progress as JSON lines, one per batch)
+  footprint         the aggregated picture, from the cache; no network
+  accounts          which of those you have a login for, via the 1Password CLI
+  import <who>      paste a provider's own connections list in on stdin
+  breaches          ask Have I Been Pwned which leaks hold the address
+
+Only `login`, `sync` and `accounts` touch anything outside this machine.
+
+Which sites hang off your Google or Apple account is not something any API
+will tell you -- the list lives only on the provider's own settings page. Two
+things stand in for it here. The mailbox proves a connection when Google
+writes "<app> was granted access to your Google Account", or when a service
+writes to an @privaterelay.appleid.com address, which only exists because you
+used Sign in with Apple. And `import` takes the provider's own page, pasted
+in, for the part no mail ever proves.
+"""
+
+import argparse
+import email
+import email.header
+import email.utils
+import imaplib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "omarchy" / "omabeam"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "omarchy" / "omabeam"
+CONFIG_FILE = CONFIG_DIR / "mail.json"
+CACHE_FILE = CACHE_DIR / "footprint.json"          # the single-mailbox file from before; migrated on first use
+ACCOUNTS_FILE = CACHE_DIR / "accounts.json"
+IDENTITY_FILE = CONFIG_DIR / "connections.json"
+BREACHES_FILE = CACHE_DIR / "breaches.json"
+HIBP_URL = "https://haveibeenpwned.com/api/v3/breachedaccount/"
+KEYRING_SERVICE = "io.github.gabbe2312.omabeam"
+
+BATCH = 400
+DEFAULT_MONTHS = 36
+
+
+def die(message, code=1):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+# ------------------------------------------------------------ json + keyring
+
+def read_json(path, fallback):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+    return data if isinstance(data, dict) else fallback
+
+
+def write_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def load_config():
+    """{"accounts": [{address, host, port, user, folders}, ...]}, migrating
+    the one-mailbox file this started with."""
+    cfg = read_json(CONFIG_FILE, {})
+    if "accounts" not in cfg:
+        cfg = {"accounts": [cfg] if cfg.get("address") else []}
+    return cfg
+
+
+def save_config(cfg):
+    write_json(CONFIG_FILE, cfg)
+
+
+def account_slug(address):
+    return re.sub(r"[^a-z0-9]+", "_", address.lower()).strip("_")
+
+
+def cache_path(address):
+    path = CACHE_DIR / ("footprint." + account_slug(address) + ".json")
+    if not path.exists() and CACHE_FILE.exists():
+        old = read_json(CACHE_FILE, {})
+        if old.get("address", "").lower() == address.lower():
+            os.replace(CACHE_FILE, path)
+    return path
+
+
+def breaches_path(address):
+    path = CACHE_DIR / ("breaches." + account_slug(address) + ".json")
+    if not path.exists() and BREACHES_FILE.exists():
+        old = read_json(BREACHES_FILE, {})
+        if old.get("address", "").lower() == address.lower():
+            os.replace(BREACHES_FILE, path)
+    return path
+
+
+def mailbox_provider(address):
+    """Who runs the mailbox: the best guess for a silent social sign-in."""
+    domain = address.rsplit("@", 1)[-1].lower()
+    if domain in ("gmail.com", "googlemail.com"):
+        return "google"
+    if domain in ("icloud.com", "me.com", "mac.com"):
+        return "apple"
+    return ""
+
+
+def keyring_lookup(account):
+    try:
+        result = subprocess.run(
+            ["secret-tool", "lookup", "service", KEYRING_SERVICE, "account", account],
+            capture_output=True, text=True, timeout=15,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("secret-tool is not installed (package: libsecret)")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the keyring did not answer. Is it unlocked?")
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError("no password in the keyring. Connect the mailbox again")
+    return result.stdout.strip("\n")
+
+
+def keyring_store(account, password):
+    try:
+        result = subprocess.run(
+            ["secret-tool", "store", "--label", "Omabeam mailbox (%s)" % account,
+             "service", KEYRING_SERVICE, "account", account],
+            input=password, capture_output=True, text=True, timeout=20,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("secret-tool is not installed (package: libsecret)")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the keyring did not answer. Is it unlocked?")
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or "could not write to the keyring").strip())
+
+
+def keyring_clear(account):
+    try:
+        subprocess.run(["secret-tool", "clear", "service", KEYRING_SERVICE, "account", account],
+                       capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+# --------------------------------------------------------------- providers
+
+PROVIDERS = {
+    "gmail.com": ("imap.gmail.com", ["[Gmail]/All Mail"]),
+    "googlemail.com": ("imap.gmail.com", ["[Gmail]/All Mail"]),
+    "icloud.com": ("imap.mail.me.com", ["INBOX", "Archive"]),
+    "me.com": ("imap.mail.me.com", ["INBOX", "Archive"]),
+    "mac.com": ("imap.mail.me.com", ["INBOX", "Archive"]),
+    "yahoo.com": ("imap.mail.yahoo.com", ["INBOX", "Archive"]),
+    "proton.me": (None, []),
+    "protonmail.com": (None, []),
+    "outlook.com": (None, []),
+    "hotmail.com": (None, []),
+    "live.com": (None, []),
+}
+
+PROVIDER_NOTES = {
+    "imap.gmail.com": "Gmail needs 2-step verification on, then an app password from myaccount.google.com/apppasswords.",
+    "imap.mail.me.com": "iCloud needs an app-specific password from appleid.apple.com.",
+}
+
+
+def guess_provider(address):
+    domain = address.rsplit("@", 1)[-1].lower()
+    if domain in PROVIDERS:
+        host, folders = PROVIDERS[domain]
+        if host is None:
+            if domain in ("proton.me", "protonmail.com"):
+                raise RuntimeError("Proton has no IMAP without the Proton Bridge. Run the bridge and pass --host 127.0.0.1 --port 1143.")
+            raise RuntimeError("Microsoft turned off password logins for IMAP; Outlook and Hotmail cannot be read this way.")
+        return host, folders
+    return "imap." + domain, ["INBOX", "Archive"]
+
+
+def connect(host, port, user, password):
+    # imaplib's default TLS context does not check the server's certificate,
+    # which would hand the app password to anyone on the path who can spoof
+    # the server. The default context verifies chain and hostname.
+    import ssl
+    tls = ssl.create_default_context()
+    try:
+        if port == 143:
+            client = imaplib.IMAP4(host, port, timeout=30)
+            client.starttls(ssl_context=tls)
+        else:
+            client = imaplib.IMAP4_SSL(host, port, timeout=30, ssl_context=tls)
+    except OSError as error:
+        raise RuntimeError("could not reach %s: %s" % (host, error))
+    try:
+        client.login(user, password)
+    except imaplib.IMAP4.error as error:
+        text = str(error)
+        hint = PROVIDER_NOTES.get(host, "")
+        raise RuntimeError("the mailbox refused the login. %s %s" % (hint, text[:160]))
+    return client
+
+
+# ------------------------------------------------------------ classifying
+
+
+
+# Google writes one of these the moment a third party is granted access to the
+# account, and the app is named in the subject itself.
+GOOGLE_GRANT_RES = [
+    re.compile(r"^(.+?) (?:was granted|has|now has) access to your Google Account", re.IGNORECASE),
+    re.compile(r"^(.+?) har .{0,14}?tilgang til Google-kontoen din", re.IGNORECASE),
+    re.compile(r"^(.+?) (?:wurde|hat) .{0,14}?Zugriff auf (?:dein|Ihr) Google-Konto", re.IGNORECASE),
+    re.compile(r"access to your Google Account (?:was granted to|for) (.+?)$", re.IGNORECASE),
+]
+APPLE_SIGNIN_RES = [
+    re.compile(r"Sign in with Apple was used (?:to sign in )?(?:to|with) (.+?)$", re.IGNORECASE),
+    re.compile(r"Logg .{0,6}? med Apple ble brukt .{0,24}?(?:p.{0,2}|med) (.+?)$", re.IGNORECASE),
+]
+MICROSOFT_GRANT_RE = re.compile(r"^(.+?) (?:has|was granted) access to your Microsoft account", re.IGNORECASE)
+
+APPLE_RELAY = "privaterelay.appleid.com"
+
+# Google's own notices about third-party access. The subject is usually just
+# "Security alert"; the app is named in the body, which is why those bodies --
+# and only those -- are read.
+GOOGLE_ALERT_SUBJECT_RE = re.compile(
+    r"security alert|sikkerhetsvarsel|sicherheitswarnung|granted access|tilgang til|"
+    r"third.?party|tredjepart|new app|ny app|connected to your google account|"
+    r"koblet til google-kontoen", re.IGNORECASE)
+GOOGLE_BODY_RES = [
+    re.compile(r"([A-Za-z0-9][\w .'’&+()-]{1,60}?)\s+(?:was|has been|is now|now has|has) (?:granted |been granted )?access to your Google Account", re.IGNORECASE),
+    re.compile(r"([A-Za-z0-9][\w .'’&+()-]{1,60}?)\s+har (?:fått |nå )?tilgang til Google-kontoen", re.IGNORECASE),
+    re.compile(r"You gave ([A-Za-z0-9][\w .'’&+()-]{1,60}?) access to your Google Account", re.IGNORECASE),
+    re.compile(r"You signed in to ([A-Za-z0-9][\w .'’&+()-]{1,60}?) with Google", re.IGNORECASE),
+    re.compile(r"Du logget (?:p.|inn) (?:p.) ([A-Za-z0-9][\w .'’&+()-]{1,60}?) med Google", re.IGNORECASE),
+]
+BODY_BYTES = 40000
+CACHE_VERSION = 6
+
+
+# What a service's own first mail says about how you got in. "You signed up
+# with Google", "Logg inn med Apple", "Continue with GitHub"...
+SIGNIN_VERB = r"(?:sign(?:ed)?[ -]?(?:up|in)|log(?:ged)?[ -]?(?:in|on)|registered|register|created|creating|continue[d]?|joined|authenticated|connected|logget (?:inn|p.)|registrert|registrer|opprettet|opprett|koblet)"
+WELCOME_RES = {
+    "google": re.compile(SIGNIN_VERB + r"[^.!?\n]{0,70}?\b(?:with|using|via|through|by|med|gjennom|via)\s+(?:your\s+|din\s+)?google\b(?!\s+(?:play|maps|drive|chrome|analytics|ads|cloud|workspace))", re.IGNORECASE),
+    "apple": re.compile(SIGNIN_VERB + r"[^.!?\n]{0,70}?\b(?:with|using|via|through|by|med|gjennom)\s+(?:your\s+|din\s+)?apple\b|sign in with apple|logg (?:inn|p.) med apple|hide my email|skjul e-postadressen", re.IGNORECASE),
+    "github": re.compile(SIGNIN_VERB + r"[^.!?\n]{0,70}?\b(?:with|using|via|through|by|med|gjennom)\s+(?:your\s+|din\s+)?github\b", re.IGNORECASE),
+    "microsoft": re.compile(SIGNIN_VERB + r"[^.!?\n]{0,70}?\b(?:with|using|via|through|by|med|gjennom)\s+(?:your\s+|din\s+)?microsoft\b", re.IGNORECASE),
+    "facebook": re.compile(SIGNIN_VERB + r"[^.!?\n]{0,70}?\b(?:with|using|via|through|by|med|gjennom)\s+(?:your\s+|din\s+)?facebook\b", re.IGNORECASE),
+}
+
+
+def provider_in_welcome(text):
+    for provider, pattern in WELCOME_RES.items():
+        if pattern.search(text):
+            return provider
+    return ""
+
+GOOGLE_SENDERS = {"google.com", "accounts.google.com", "googlemail.com", "gmail.com"}
+APPLE_SENDERS = {"apple.com", "icloud.com", "id.apple.com", "appleid.com"}
+MICROSOFT_SENDERS = {"microsoft.com", "microsoftonline.com", "accountprotection.net", "live.com"}
+
+PROVIDERS_KNOWN = ["google", "apple", "microsoft", "facebook", "github"]
+
+PROVIDER_PAGES = {
+    "google": "https://myaccount.google.com/connections",
+    "apple": "https://account.apple.com/account/manage/section/security",
+    "microsoft": "https://account.live.com/consent/Manage",
+    "facebook": "https://www.facebook.com/settings?tab=applications",
+    "github": "https://github.com/settings/applications",
+}
+
+# Lines the provider pages put around the names, which a paste brings along.
+# Furniture on the provider pages: headings, column labels, buttons. Matched
+# as prefixes rather than whole words, because the Norwegian pages glue them
+# together ("tredjepartsapper") and the English ones inflect them.
+IMPORT_NOISE_RE = re.compile(
+    r"^(third.?party|tredjeparts|authoriz|authoris|oauth|revoke|owned by|connected|disconnect|"
+    r"stop using|slutt |apps? (with|and|you)|apper (med|og|du)|you (have|gave|granted)|du (har|ga)|"
+    r"has access|have access|har tilgang|access to|tilgang til|see details|se detaljer|details|detaljer|"
+    r"manage|administrer|remove|fjern|last used|first used|sist brukt|created|opprettet|granted|"
+    r"access given|home|security|sikkerhet|data|privacy|personvern|settings|innstillinger|search|"
+    r"menu|meny|back|tilbake|next|neste|show more|show all|see all|vis mer|vis alle|learn more|"
+    r"these apps|your (apps|data|account)|permissions|tillatelser|scopes|allow|tillat|deny|nekt|"
+    r"continue|fortsett|cancel|avbryt|delete|slett|edit|rediger|view|help|hjelp|about|support|"
+    r"sort|filter|all apps|no apps|nothing|none\b|sign ?in with|signed in with|logg (p.|inn) med|"
+    r"google|apple|microsoft|facebook|github)",
+    re.IGNORECASE)
+
+# The words a page uses when it is talking about the account rather than
+# naming something on it.
+IMPORT_ABOUT_RE = re.compile(
+    r"(apple id|google account|google-konto|microsoft account|microsoft-konto|"
+    r"facebook account|account access|kontotilgang)", re.IGNORECASE)
+
+# A name is a name; a sentence about a name is not. Anything this long is the
+# page explaining itself.
+IMPORT_MAX_WORDS = 4
+
+
+def normalise_name(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def detect_identity(msg, to_fields):
+    """(provider, app name) proven by this one message, or (None, None)."""
+    subject = decode_header(msg.get("Subject", "")).strip()
+    _, sender = email.utils.parseaddr(decode_header(msg.get("From", "")))
+    domain = base_domain((sender or "").rsplit("@", 1)[-1])
+
+    # A service writing to a relay address is there because Sign in with
+    # Apple put it there; no Apple mail has to prove it.
+    for field in to_fields:
+        if APPLE_RELAY in field.lower():
+            return "apple", None
+
+    if domain in GOOGLE_SENDERS:
+        for pattern in GOOGLE_GRANT_RES:
+            found = pattern.search(subject)
+            if found:
+                return "google", found.group(1).strip(" .\u2019'\"")
+    if domain in APPLE_SENDERS:
+        for pattern in APPLE_SIGNIN_RES:
+            found = pattern.search(subject)
+            if found:
+                return "apple", found.group(1).strip(" .\u2019'\"")
+    if domain in MICROSOFT_SENDERS:
+        found = MICROSOFT_GRANT_RE.search(subject)
+        if found:
+            return "microsoft", found.group(1).strip(" .\u2019'\"")
+    return None, None
+
+
+
+# ------------------------------------------------------------- word lists
+
+# Everything the classifier matches on lives in words.json beside this
+# script, so a word can be added without touching the code. The tests in
+# ../tests cover the lists, so a bad edit shows up before it costs anything.
+WORDS_FILE = Path(__file__).resolve().parent / "words.json"
+
+
+def load_words():
+    try:
+        with WORDS_FILE.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as error:
+        die("could not read %s: %s" % (WORDS_FILE, error))
+
+
+WORDS = load_words()
+ALERT_RE = re.compile(WORDS["alert"], re.IGNORECASE)
+ACCOUNT_RE = re.compile(WORDS["account"], re.IGNORECASE)
+RECEIPT_RE = re.compile(WORDS["receipt"], re.IGNORECASE)
+NEWSLETTER_RE = re.compile(WORDS["newsletter"], re.IGNORECASE)
+VERIFY_RE = re.compile(WORDS["verify"], re.IGNORECASE)
+AUTOMATED_LOCAL_RE = re.compile(WORDS["automated_sender"], re.IGNORECASE)
+FREEMAIL = set(WORDS["freemail"])
+FAMILIES = WORDS["families"]
+
+FAMILY_OF = {domain: name for name, domains in FAMILIES.items() for domain in domains}
+
+GENERIC_SECOND_LEVEL = {"co", "com", "net", "org", "ac", "gov", "edu", "or", "ne"}
+
+
+def base_domain(name):
+    labels = name.lower().strip(".").split(".")
+    if len(labels) < 2:
+        return name.lower()
+    if len(labels) >= 3 and labels[-2] in GENERIC_SECOND_LEVEL and len(labels[-1]) == 2:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def classify(subject, unsubscribe):
+    if ALERT_RE.search(subject):
+        return "alert"
+    # Receipts before accounts: "Ordrebekreftelse" and "order confirmation"
+    # carry account words inside them, and are receipts.
+    if RECEIPT_RE.search(subject):
+        return "receipt"
+    if ACCOUNT_RE.search(subject):
+        return "account"
+    if unsubscribe or NEWSLETTER_RE.search(subject):
+        return "newsletter"
+    return "other"
+
+
+def decode_header(value):
+    if not value:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(value)))
+    except Exception:
+        return str(value)
+
+
+def parse_date(value):
+    try:
+        parsed = email.utils.parsedate_to_datetime(value)
+    except Exception:
+        return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+# ------------------------------------------------------------------- sync
+
+def empty_cache(address):
+    return {"address": address, "syncedAt": 0, "folders": {}, "senders": {}, "people": 0,
+            "totalMails": 0, "months": DEFAULT_MONTHS, "identities": {}, "aliases": {},
+            "version": CACHE_VERSION}
+
+
+def load_cache(address):
+    cache = read_json(cache_path(address), None)
+    if not cache or not isinstance(cache.get("senders"), dict):
+        return None
+    cache.setdefault("identities", {})
+    cache.setdefault("aliases", {})
+    return cache
+
+
+def note_identity(cache, provider, app, when, source, domain=""):
+    """Record that `app` hangs off `provider`. Names come from the provider's
+    own wording, so the same app can arrive spelled two ways; the key is the
+    flattened name and the prettiest spelling seen wins."""
+    entry = cache["identities"].setdefault(provider, {})
+    key = normalise_name(app or domain)
+    if not key:
+        return
+    record = entry.get(key)
+    if record is None:
+        record = entry[key] = {"name": app or domain, "first": when, "last": when,
+                               "source": source, "domain": domain}
+    record["last"] = max(record.get("last", when), when)
+    record["first"] = min(record.get("first", when), when)
+    if app and len(app) > len(record.get("name", "")) and len(app) < 48:
+        record["name"] = app
+    if domain and not record.get("domain"):
+        record["domain"] = domain
+    # A grant seen in the mailbox is stronger evidence than a pasted list.
+    if source == "mail":
+        record["source"] = "mail"
+
+
+def fold_message(cache, own_address, headers, now):
+    """One header block into the sender table. Returns True if it counted."""
+    msg = email.message_from_bytes(headers)
+    display, addr = email.utils.parseaddr(decode_header(msg.get("From", "")))
+    addr = (addr or "").strip().lower()
+    if "@" not in addr:
+        return False
+    local, _, domain = addr.rpartition("@")
+    domain = base_domain(domain)
+    if addr == own_address.lower():
+        return False
+
+    to_fields = [decode_header(msg.get("To", "")), decode_header(msg.get("Delivered-To", ""))]
+    when_hdr = parse_date(msg.get("Date", "")) or now
+    provider, app = detect_identity(msg, to_fields)
+    # A Google notice that did not name the app in the subject: ask for the
+    # body later. Remembered on the cache so the sync loop can collect them.
+    if provider is None and domain in GOOGLE_SENDERS and GOOGLE_ALERT_SUBJECT_RE.search(decode_header(msg.get("Subject", ""))):
+        cache.setdefault("_wantBody", []).append(when_hdr)
+    if provider:
+        # A grant names the app; a relay address names nobody, so the sender
+        # itself is the app.
+        note_identity(cache, provider, app or display.strip() or domain, when_hdr, "mail",
+                      "" if app else domain)
+        if not app:
+            cache["senders"].setdefault(domain, {}).setdefault("identity", provider)
+            alias = ""
+            for field in to_fields:
+                if APPLE_RELAY in field.lower():
+                    _, alias = email.utils.parseaddr(field)
+                    break
+            if alias:
+                cache["aliases"][domain] = alias
+
+    subject = decode_header(msg.get("Subject", "")).strip()
+    unsubscribe = bool(msg.get("List-Unsubscribe"))
+    automated = bool(AUTOMATED_LOCAL_RE.match(local)) or unsubscribe
+    if domain in FREEMAIL and not automated:
+        cache["people"] += 1
+        return True
+
+    when = parse_date(msg.get("Date", "")) or now
+    category = classify(subject, unsubscribe)
+
+    sender = cache["senders"].get(domain)
+    if sender is None or "count" not in sender:
+        stub = sender or {}
+        sender = cache["senders"][domain] = {
+            "domain": domain, "names": {}, "locals": {}, "count": 0, "first": when, "last": when,
+            "cats": {"alert": 0, "account": 0, "receipt": 0, "newsletter": 0, "other": 0},
+            "unsubscribe": False, "identity": stub.get("identity", ""),
+        }
+    sender["count"] += 1
+    if VERIFY_RE.search(subject):
+        sender["verified"] = True
+    if sender["count"] == 1 and not sender.get("identity"):
+        cache.setdefault("_wantWelcome", []).append(domain)
+    sender["first"] = min(sender["first"], when)
+    sender["last"] = max(sender["last"], when)
+    sender["cats"][category] = sender["cats"].get(category, 0) + 1
+    sender["unsubscribe"] = sender["unsubscribe"] or unsubscribe
+    display = display.strip().strip('"')
+    if display and "@" not in display:
+        sender["names"][display] = sender["names"].get(display, 0) + 1
+    sender["locals"][local] = sender["locals"].get(local, 0) + 1
+    return True
+
+
+UID_RE = re.compile(rb"UID (\d+)")
+
+
+def body_text(raw):
+    """Readable text out of a raw message, html stripped."""
+    try:
+        msg = email.message_from_bytes(raw)
+    except Exception:
+        return ""
+    chunks = []
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            payload = part.get_payload(decode=True) or b""
+        except Exception:
+            continue
+        charset = part.get_content_charset() or "utf-8"
+        text = payload.decode(charset, "replace")
+        if ctype == "text/html":
+            text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+            # Block ends become sentence ends, so a heading or a table cell
+            # before the app's name does not get glued onto it.
+            text = re.sub(r"</(p|div|td|th|tr|li|h\d|br|table)\s*>|<br\s*/?>", " . ", text, flags=re.IGNORECASE)
+            text = re.sub(r"<[^>]+>", " ", text)
+            import html as htmllib
+            text = htmllib.unescape(text)
+        chunks.append(text)
+    return re.sub(r"\s+", " ", " ".join(chunks))
+
+
+def google_apps_in_body(text):
+    found = []
+    for pattern in GOOGLE_BODY_RES:
+        for match in pattern.finditer(text):
+            name = match.group(1).strip(" .’'\"")
+            # Whatever came before the last sentence break is not the name.
+            name = re.split(r"[.!?:]\s+", name)[-1].strip()
+            # The sentence often starts with a greeting; keep the tail.
+            name = re.sub(r"^(?:hi|hei|hello|hallo|dear)\s+\S+\s+", "", name, flags=re.IGNORECASE)
+            if 1 < len(name) <= 60 and not re.search(r"\b(your|you|din|du|google)\b", name, re.IGNORECASE):
+                found.append(name)
+    return found
+
+
+def fetch_bodies(client, uids):
+    """uid -> raw message (first BODY_BYTES) for a small set of uids."""
+    if not uids:
+        return {}
+    ok, data = client.uid("FETCH", ",".join(str(u) for u in uids), "(BODY.PEEK[]<0.%d>)" % BODY_BYTES)
+    if ok != "OK":
+        return {}
+    out = {}
+    for part in data:
+        if not isinstance(part, tuple) or len(part) < 2:
+            continue
+        match = UID_RE.search(part[0])
+        if match:
+            out[int(match.group(1))] = part[1]
+    return out
+
+
+def fetch_headers(client, uids):
+    """uid -> raw header bytes for one batch."""
+    if not uids:
+        return {}
+    ok, data = client.uid("FETCH", ",".join(str(u) for u in uids),
+                          "(BODY.PEEK[HEADER.FIELDS (FROM DATE SUBJECT LIST-UNSUBSCRIBE TO DELIVERED-TO)])")
+    if ok != "OK":
+        raise RuntimeError("the server would not hand over headers")
+    out = {}
+    for part in data:
+        if not isinstance(part, tuple) or len(part) < 2:
+            continue
+        match = UID_RE.search(part[0])
+        if match:
+            out[int(match.group(1))] = part[1]
+    return out
+
+
+def run_sync(months, full, only=""):
+    accounts = load_config()["accounts"]
+    if not accounts:
+        die("no mailbox connected")
+    for account in accounts:
+        if only and account["address"].lower() != only.lower():
+            continue
+        try:
+            sync_account(account, months, full)
+        except RuntimeError as error:
+            emit({"address": account["address"], "error": str(error)})
+            print("%s: %s" % (account["address"], error), file=sys.stderr)
+    emit({"done": True})
+
+
+def sync_account(config, months, full):
+    address = config["address"]
+    password = keyring_lookup(address)
+    cache = load_cache(address)
+    if full or not cache or cache.get("address") != address or cache.get("version", 1) < CACHE_VERSION:
+        cache = empty_cache(address)
+    months = months or cache.get("months") or DEFAULT_MONTHS
+    cache["months"] = months
+    since = (datetime.now(timezone.utc) - timedelta(days=30 * months)).strftime("%d-%b-%Y")
+    now = time.time()
+
+    client = connect(config["host"], int(config.get("port", 993)), config.get("user") or address, password)
+    try:
+        ok, listing = client.list()
+        available = set()
+        everything = ""
+        if ok == "OK":
+            for line in listing or []:
+                if isinstance(line, bytes):
+                    text = line.decode("utf-8", "replace")
+                    match = re.search(r'(?:"([^"]+)"|(\S+))\s*$', text)
+                    if not match:
+                        continue
+                    name = match.group(1) or match.group(2)
+                    available.add(name)
+                    # Gmail's "All Mail" is named in the account's language
+                    # ("Alle e-poster" here); the \All flag is what it is.
+                    if "\\All" in text.split('"')[0]:
+                        everything = name
+        if everything:
+            folders = [everything]
+        else:
+            folders = [f for f in config.get("folders", []) if f in available or f == "INBOX"] or ["INBOX"]
+
+        for folder in folders:
+            ok, info = client.select('"%s"' % folder, readonly=True)
+            if ok != "OK":
+                continue
+            ok, validity = client.response("UIDVALIDITY")
+            validity = validity[0].decode() if validity and validity[0] else ""
+            state = cache["folders"].get(folder, {})
+            if state.get("uidvalidity") != validity:
+                state = {"uidvalidity": validity, "lastUid": 0}
+            start = int(state.get("lastUid", 0)) + 1
+            ok, found = client.uid("SEARCH", None, "UID", "%d:*" % start, "SINCE", since)
+            uids = [int(u) for u in (found[0].split() if ok == "OK" and found and found[0] else [])]
+            uids = [u for u in uids if u >= start]
+            total = len(uids)
+            emit({"address": address, "folder": folder, "progress": 0, "total": total})
+            done = 0
+            for i in range(0, total, BATCH):
+                batch = uids[i:i + BATCH]
+                headers = fetch_headers(client, batch)
+                want_body = []
+                want_welcome = {}
+                for uid in batch:
+                    raw = headers.get(uid)
+                    before = len(cache.get("_wantBody", []))
+                    seen = len(cache.get("_wantWelcome", []))
+                    if raw and fold_message(cache, address, raw, now):
+                        cache["totalMails"] += 1
+                    if len(cache.get("_wantBody", [])) > before:
+                        want_body.append(uid)
+                    if len(cache.get("_wantWelcome", [])) > seen:
+                        want_welcome[uid] = cache["_wantWelcome"][-1]
+                cache.pop("_wantBody", None)
+                cache.pop("_wantWelcome", None)
+                # The first mail a service ever sent is where it says how you
+                # got in. One body per service, nothing else.
+                for uid, raw in fetch_bodies(client, list(want_welcome)).items():
+                    provider = provider_in_welcome(body_text(raw))
+                    if not provider:
+                        continue
+                    dom = want_welcome[uid]
+                    sender = cache["senders"].get(dom)
+                    if sender is None:
+                        continue
+                    sender["identity"] = provider
+                    sender["identitySource"] = "welcome"
+                    name = max(sender["names"].items(), key=lambda kv: kv[1])[0] if sender["names"] else dom
+                    note_identity(cache, provider, name, sender["first"], "mail", dom)
+                # Only Google's own notices get their body read, and only to
+                # find the app they are about.
+                for uid, raw in fetch_bodies(client, want_body).items():
+                    when = parse_date(email.message_from_bytes(raw).get("Date", "")) or now
+                    for app in google_apps_in_body(body_text(raw)):
+                        note_identity(cache, "google", app, when, "mail")
+                done += len(batch)
+                state["lastUid"] = max(int(state.get("lastUid", 0)), max(batch))
+                cache["folders"][folder] = state
+                cache["syncedAt"] = time.time()
+                write_json(cache_path(address), cache)
+                emit({"address": address, "folder": folder, "progress": done, "total": total})
+            cache["folders"][folder] = state
+        cache["syncedAt"] = time.time()
+        write_json(cache_path(address), cache)
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+    emit({"address": address, "synced": True, "services": len(cache["senders"]), "mails": cache["totalMails"]})
+
+
+# --------------------------------------------------------------- footprint
+
+def pretty_name(sender):
+    names = sender.get("names") or {}
+    if names:
+        best = max(names.items(), key=lambda kv: kv[1])[0]
+        cleaned = re.sub(r"\s*(\(|<|\||-|–|—)\s*(no.?reply|do not reply|ikke svar).*$", "", best, flags=re.IGNORECASE).strip()
+        if cleaned and not AUTOMATED_LOCAL_RE.match(cleaned.replace(" ", "")):
+            return cleaned[:40]
+    label = sender["domain"].split(".")[0]
+    return label[:1].upper() + label[1:]
+
+
+def dominant(cats):
+    order = ["account", "receipt", "alert", "newsletter", "other"]
+    # Alerts and account mail both prove an account; a purchase proves more
+    # than a newsletter. Pick by weight, not raw count, so a shop that sends
+    # one receipt and forty promotions still reads as a shop.
+    weights = {"account": 3, "alert": 3, "receipt": 2.5, "newsletter": 0.6, "other": 1}
+    best = max(order, key=lambda c: cats.get(c, 0) * weights[c])
+    return best if cats.get(best, 0) > 0 else "other"
+
+
+def group_keys(group):
+    """Every spelling of a service that a provider's list might have used."""
+    keys = {normalise_name(group["name"])}
+    for domain in group["domains"]:
+        keys.add(normalise_name(domain))
+        keys.add(normalise_name(domain.split(".")[0]))
+    keys.discard("")
+    return keys
+
+
+def run_footprint():
+    cfg = load_config()
+    logins = read_json(ACCOUNTS_FILE, {}).get("domains", {})
+    imported = read_json(IDENTITY_FILE, {}).get("identities", {})
+    models = []
+    all_services = []
+    claimed_any = {}
+    for account in cfg["accounts"]:
+        address = account["address"]
+        cache = load_cache(address)
+        model = {"address": address, "provider": mailbox_provider(address), "host": account.get("host", ""),
+                 "syncedAt": 0, "totalMails": 0, "people": 0, "months": DEFAULT_MONTHS, "services": 0,
+                 "breaches": 0, "breachesAt": 0}
+        services = []
+        if cache:
+            services, claimed = footprint_account(cache, logins)
+            for provider, keys in claimed.items():
+                claimed_any.setdefault(provider, set()).update(keys)
+            model.update({"syncedAt": cache.get("syncedAt", 0), "totalMails": cache.get("totalMails", 0),
+                          "people": cache.get("people", 0), "months": cache.get("months", DEFAULT_MONTHS)})
+        breach_data = load_breaches(address)
+        attach_breaches(services, breach_data.get("breaches") or [])
+        model["breaches"] = len(breach_data.get("breaches") or [])
+        model["breachesAt"] = breach_data.get("at", 0)
+        for service in services:
+            service["mailbox"] = address
+            service["id"] = address + "|" + service["id"]
+        model["services"] = len(services)
+        models.append(model)
+        all_services.extend(services)
+
+    # Apps a provider's own page lists but no mailbox ever saw: shown once,
+    # on the first mailbox, since a pasted list is not tied to an address.
+    extra = provider_only_services(imported, claimed_any)
+    for service in extra:
+        service["mailbox"] = models[0]["address"] if models else ""
+        service["id"] = (models[0]["address"] + "|" if models else "") + service["id"]
+    all_services.extend(extra)
+    all_services.sort(key=lambda g: (-g["mails"], g["name"].lower()))
+
+    identities_all = dict(imported)
+    for account in cfg["accounts"]:
+        cache = load_cache(account["address"])
+        if cache:
+            for provider, apps in merged_identities(cache).items():
+                identities_all.setdefault(provider, {}).update(apps)
+
+    first = models[0] if models else {}
+    emit({
+        "configured": bool(models),
+        "accounts": models,
+        "address": first.get("address", ""),
+        "syncedAt": min([m["syncedAt"] for m in models if m["syncedAt"]] or [0]),
+        "months": first.get("months", DEFAULT_MONTHS),
+        "totalMails": sum(m["totalMails"] for m in models),
+        "people": sum(m["people"] for m in models),
+        "logins": len(logins),
+        "services": all_services,
+        "providers": provider_summary(identities_all, all_services),
+        "pages": PROVIDER_PAGES,
+        "breaches": sum(m["breaches"] for m in models),
+        "breachesAt": max([m["breachesAt"] for m in models] or [0]),
+    })
+
+
+def footprint_account(cache, logins):
+    """The services one mailbox knows, as groups with their identity."""
+    groups = {}
+    for domain, sender in cache["senders"].items():
+        family = FAMILY_OF.get(domain)
+        key = ("family:" + family) if family else ("domain:" + domain)
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "id": key, "name": family or pretty_name(sender), "owner": family or "",
+                "domains": [], "mails": 0, "first": sender["first"], "last": sender["last"],
+                "cats": {"alert": 0, "account": 0, "receipt": 0, "newsletter": 0, "other": 0},
+                "unsubscribe": False, "login": False, "verified": False,
+            }
+        group["domains"].append(domain)
+        group["mails"] += sender["count"]
+        group["first"] = min(group["first"], sender["first"])
+        group["last"] = max(group["last"], sender["last"])
+        for cat, n in sender["cats"].items():
+            group["cats"][cat] = group["cats"].get(cat, 0) + n
+        group["unsubscribe"] = group["unsubscribe"] or sender["unsubscribe"]
+        group["verified"] = group["verified"] or bool(sender.get("verified"))
+        if domain in logins:
+            group["login"] = True
+
+    identities = merged_identities(cache)
+    guess = mailbox_provider(cache["address"])
+    claimed = {}
+    services = []
+    for group in groups.values():
+        group["category"] = dominant(group["cats"])
+        group["domains"].sort()
+        keys = group_keys(group)
+        group["identity"] = ""
+        group["identitySource"] = ""
+        for provider in PROVIDERS_KNOWN:
+            hit = keys & set(identities.get(provider, {}).keys())
+            if hit:
+                key = sorted(hit)[0]
+                group["identity"] = provider
+                group["identitySource"] = identities[provider][key].get("source", "")
+                claimed.setdefault(provider, set()).add(key)
+                break
+        if not group["identity"]:
+            for domain in group["domains"]:
+                sender = cache["senders"].get(domain) or {}
+                if sender.get("identity"):
+                    group["identity"] = sender["identity"]
+                    group["identitySource"] = "mail"
+                    break
+        # The guess: a customer relationship with no "confirm your address"
+        # ever sent. Social sign-ins skip that step; passwords do not.
+        cats = group["cats"]
+        has_account = (cats.get("account", 0) + cats.get("alert", 0) + cats.get("receipt", 0)) > 0
+        own_house = (group.get("owner") or "").lower() in ("google", "apple", "microsoft")
+        if not group["identity"] and guess and has_account and not group["verified"] and not own_house:
+            group["identity"] = "probably-" + guess
+            group["identitySource"] = "guess"
+        group["alias"] = next((cache["aliases"][d] for d in group["domains"] if d in cache["aliases"]), "")
+        services.append(group)
+    return services, claimed
+
+
+def merged_identities(cache):
+    """The mailbox's findings on top of every pasted provider list."""
+    merged = {}
+    for source in (read_json(IDENTITY_FILE, {}).get("identities", {}), cache.get("identities", {})):
+        for provider, apps in (source or {}).items():
+            target = merged.setdefault(provider, {})
+            for key, record in apps.items():
+                existing = target.get(key)
+                if existing is None:
+                    target[key] = dict(record)
+                else:
+                    existing["last"] = max(existing.get("last", 0), record.get("last", 0))
+                    if record.get("source") == "mail":
+                        existing["source"] = "mail"
+    return merged
+
+
+def provider_only_services(identities, claimed):
+    """Apps a provider lists that never wrote to you -- still connections."""
+    out = []
+    for provider, apps in (identities or {}).items():
+        for key, record in apps.items():
+            if key in (claimed.get(provider) or set()):
+                continue
+            out.append({
+                "id": "id:" + provider + ":" + key,
+                "name": record.get("name") or key,
+                "owner": "",
+                "domains": [record["domain"]] if record.get("domain") else [],
+                "mails": 0,
+                "first": record.get("first", 0),
+                "last": record.get("last", 0),
+                "cats": {"alert": 0, "account": 0, "receipt": 0, "newsletter": 0, "other": 0},
+                "unsubscribe": False,
+                "login": False,
+                "category": "account",
+                "identity": provider,
+                "identitySource": record.get("source", "import"),
+                "alias": "",
+            })
+    return out
+
+
+def provider_summary(identities, services):
+    counts = {}
+    for service in services:
+        if service.get("identity"):
+            counts[service["identity"]] = counts.get(service["identity"], 0) + 1
+    out = []
+    for provider in PROVIDERS_KNOWN:
+        known = len((identities or {}).get(provider, {}))
+        if known == 0 and counts.get(provider, 0) == 0:
+            out.append({"id": provider, "count": 0, "page": PROVIDER_PAGES.get(provider, "")})
+        else:
+            out.append({"id": provider, "count": counts.get(provider, known),
+                        "page": PROVIDER_PAGES.get(provider, "")})
+    return out
+
+
+# ---------------------------------------------------------------- accounts
+
+def run_accounts():
+    """Domains you hold a login for, from the 1Password CLI."""
+    try:
+        result = subprocess.run(["op", "item", "list", "--categories", "Login", "--format", "json"],
+                                capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        die("the 1Password CLI (op) is not installed")
+    except subprocess.TimeoutExpired:
+        die("1Password did not answer. Is the app unlocked and CLI integration on?")
+    if result.returncode != 0:
+        die((result.stderr or "1Password refused").strip()[:200])
+    try:
+        items = json.loads(result.stdout or "[]")
+    except ValueError:
+        die("1Password returned something that is not JSON")
+    domains = {}
+    for item in items:
+        for url in item.get("urls") or []:
+            href = url.get("href") or ""
+            host = re.sub(r"^[a-z]+://", "", href).split("/")[0].split(":")[0].lower()
+            if "." not in host:
+                continue
+            domain = base_domain(host)
+            domains.setdefault(domain, []).append(item.get("title", ""))
+    write_json(ACCOUNTS_FILE, {"at": time.time(), "domains": domains})
+    emit({"logins": len(domains)})
+
+
+# ---------------------------------------------------------------- breaches
+
+XON_URL = "https://api.xposedornot.com/v1/breach-analytics?email="
+
+
+def run_breaches(address):
+    """Which breaches hold the address: XposedOrNot for free, Have I Been
+    Pwned when a key is set. One address, or every mailbox."""
+    key = os.environ.get("HIBP_API_KEY", "").strip()
+    targets = [address] if address else [a["address"] for a in load_config()["accounts"]]
+    if not targets:
+        die("no address to check")
+    for target in targets:
+        if key:
+            check_breaches(target, key)
+        else:
+            check_breaches_xon(target)
+
+
+def check_breaches_xon(address):
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    request = urllib.request.Request(
+        XON_URL + urllib.parse.quote(address),
+        headers={"user-agent": "omabeam/1.0 (+https://github.com/Gabbe2312/omabeam)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            data = {}
+        elif error.code == 429:
+            die("XposedOrNot asked us to slow down; try again in a minute")
+        else:
+            die("XposedOrNot answered %d" % error.code)
+    except (OSError, ValueError) as error:
+        die("could not reach XposedOrNot: %s" % error)
+    kept = []
+    details = ((data.get("ExposedBreaches") or {}).get("breaches_details")) or []
+    for b in details:
+        name = b.get("breach", "")
+        classes = [c.strip() for c in (b.get("xposed_data") or "").split(";") if c.strip()]
+        year = str(b.get("xposed_date", "") or "")
+        kept.append({
+            "name": name,
+            "title": name,
+            "domain": base_domain(b.get("domain") or "") if b.get("domain") else "",
+            "date": year,
+            "added": "",
+            "count": b.get("xposed_records", 0),
+            "data": classes,
+            "verified": True,
+            "source": "xposedornot",
+        })
+    kept.sort(key=lambda b: b["date"], reverse=True)
+    pastes = ((data.get("PastesSummary") or {}).get("cnt")) or 0
+    write_json(breaches_path(address), {"address": address, "at": time.time(), "breaches": kept,
+                                        "pastes": pastes, "source": "xposedornot"})
+    emit({"address": address, "breaches": len(kept), "source": "xposedornot"})
+
+
+def check_breaches(address, key):
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    request = urllib.request.Request(
+        HIBP_URL + urllib.parse.quote(address) + "?truncateResponse=false",
+        headers={"hibp-api-key": key, "user-agent": "omabeam/1.0 (+https://github.com/Gabbe2312/omabeam)"},
+    )
+    breaches = []
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            breaches = json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            breaches = []
+        elif error.code == 401:
+            die("Have I Been Pwned rejected the key")
+        elif error.code == 429:
+            die("Have I Been Pwned asked us to slow down; try again in a minute")
+        else:
+            die("Have I Been Pwned answered %d" % error.code)
+    except (OSError, ValueError) as error:
+        die("could not reach Have I Been Pwned: %s" % error)
+    kept = []
+    for b in breaches if isinstance(breaches, list) else []:
+        kept.append({
+            "name": b.get("Name", ""),
+            "title": b.get("Title") or b.get("Name", ""),
+            "domain": base_domain(b.get("Domain") or "") if b.get("Domain") else "",
+            "date": b.get("BreachDate", ""),
+            "added": b.get("AddedDate", ""),
+            "count": b.get("PwnCount", 0),
+            "data": b.get("DataClasses") or [],
+            "verified": bool(b.get("IsVerified", True)),
+        })
+    kept.sort(key=lambda b: b["date"], reverse=True)
+    write_json(breaches_path(address), {"address": address, "at": time.time(), "breaches": kept})
+    emit({"address": address, "breaches": len(kept)})
+
+
+def load_breaches(address):
+    if not address:
+        return {}
+    return read_json(breaches_path(address), {})
+
+
+def attach_breaches(services, breaches):
+    """Pin each breach on the service it belongs to; the rest become nodes."""
+    if not breaches:
+        return
+    by_key = {}
+    for service in services:
+        service["breaches"] = []
+        for key in group_keys(service):
+            by_key.setdefault(key, service)
+    for b in breaches:
+        target = None
+        for key in (normalise_name(b["domain"]), normalise_name(b["domain"].split(".")[0]) if b["domain"] else "",
+                    normalise_name(b["title"]), normalise_name(b["name"])):
+            if key and key in by_key:
+                target = by_key[key]
+                break
+        if target is None:
+            target = {
+                "id": "breach:" + normalise_name(b["name"]),
+                "name": b["title"], "owner": "", "domains": [b["domain"]] if b["domain"] else [],
+                "mails": 0, "first": 0, "last": 0,
+                "cats": {"alert": 0, "account": 0, "receipt": 0, "newsletter": 0, "other": 0},
+                "unsubscribe": False, "login": False, "category": "account",
+                "identity": "", "identitySource": "", "alias": "", "breaches": [],
+            }
+            services.append(target)
+            for key in group_keys(target):
+                by_key.setdefault(key, target)
+        target["breaches"].append(b)
+
+
+# ------------------------------------------------------------------ import
+
+def parse_pasted(text):
+    """App names out of a provider's settings page, pasted in whole.
+
+    The pages differ and change, so nothing here knows their layout: keep the
+    lines that look like the name of a thing, drop the furniture around them.
+    """
+    names = []
+    seen = set()
+    for raw in str(text or "").splitlines():
+        line = raw.strip().strip("\u2022-*\u2013\u2014\t ")
+        line = re.sub(r"\s{2,}.*$", "", line)          # trailing column of a table
+        line = re.sub(r"\s*[\u00b7|]\s*.*$", "", line)   # "Spotify · Has access"
+        if not line or len(line) > 48:
+            continue
+        if IMPORT_NOISE_RE.match(line) or IMPORT_ABOUT_RE.search(line):
+            continue
+        if re.match(r"^[\d\W_]+$", line):               # dates, counts, icons
+            continue
+        if len(line.split()) > IMPORT_MAX_WORDS:
+            continue
+        if re.search(r"\b(access|tilgang|zugriff|app|apps|account|konto)\b", line, re.IGNORECASE) and len(line.split()) > 2:
+            continue
+        if line.endswith(":") or line.endswith(","):
+            continue
+        key = normalise_name(line)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        names.append(line)
+    return names
+
+
+def read_clipboard():
+    try:
+        result = subprocess.run(["wl-paste", "-n"], capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        raise RuntimeError("wl-paste is not installed (package: wl-clipboard)")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("the clipboard did not answer")
+    if result.returncode != 0:
+        raise RuntimeError("the clipboard is empty")
+    return result.stdout
+
+
+def run_import(provider, replace, clipboard):
+    provider = provider.lower()
+    if provider not in PROVIDERS_KNOWN:
+        die("unknown provider: %s (try %s)" % (provider, ", ".join(PROVIDERS_KNOWN)))
+    names = parse_pasted(read_clipboard() if clipboard else sys.stdin.read())
+    store = read_json(IDENTITY_FILE, {"identities": {}})
+    store.setdefault("identities", {})
+    if replace:
+        store["identities"][provider] = {}
+    bucket = store["identities"].setdefault(provider, {})
+    now = time.time()
+    added = 0
+    for name in names:
+        key = normalise_name(name)
+        if key not in bucket:
+            added += 1
+        record = bucket.setdefault(key, {"name": name, "first": now, "last": now,
+                                         "source": "import", "domain": ""})
+        record["name"] = name
+        record["last"] = now
+    write_json(IDENTITY_FILE, store)
+    emit({"provider": provider, "parsed": len(names), "added": added, "total": len(bucket),
+          "names": names[:40]})
+
+
+def run_forget(provider):
+    store = read_json(IDENTITY_FILE, {"identities": {}})
+    if provider:
+        (store.get("identities") or {}).pop(provider.lower(), None)
+    else:
+        store["identities"] = {}
+    write_json(IDENTITY_FILE, store)
+    emit({"ok": True})
+
+
+# ------------------------------------------------------------------- main
+
+def run_login(address, host, port, user):
+    password = sys.stdin.read().strip("\r\n")
+    if not password:
+        die("no password given")
+    if not host:
+        host, folders = guess_provider(address)
+    else:
+        folders = ["INBOX", "Archive"]
+    port = port or 993
+    client = connect(host, port, user or address, password)
+    try:
+        client.logout()
+    except Exception:
+        pass
+    keyring_store(address, password)
+    cfg = load_config()
+    entry = {"address": address, "host": host, "port": port, "user": user or address, "folders": folders}
+    cfg["accounts"] = [a for a in cfg["accounts"] if a["address"].lower() != address.lower()] + [entry]
+    save_config(cfg)
+    emit({"ok": True, "address": address, "host": host, "accounts": len(cfg["accounts"])})
+
+
+def run_logout(address):
+    cfg = load_config()
+    gone = [a for a in cfg["accounts"] if not address or a["address"].lower() == address.lower()]
+    cfg["accounts"] = [a for a in cfg["accounts"] if a not in gone]
+    for account in gone:
+        keyring_clear(account["address"])
+        for path in (cache_path(account["address"]), breaches_path(account["address"])):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+    save_config(cfg)
+    emit({"ok": True, "removed": [a["address"] for a in gone], "accounts": len(cfg["accounts"])})
+
+
+def run_status():
+    out = []
+    for account in load_config()["accounts"]:
+        cache = read_json(cache_path(account["address"]), {})
+        out.append({"address": account["address"], "host": account.get("host", ""),
+                    "syncedAt": cache.get("syncedAt", 0), "services": len(cache.get("senders", {})),
+                    "mails": cache.get("totalMails", 0)})
+    emit({"configured": bool(out), "accounts": out, "address": out[0]["address"] if out else ""})
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="omabeam-mail", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    login = sub.add_parser("login", help="connect a mailbox; the app password is read from stdin")
+    login.add_argument("address")
+    login.add_argument("--host", default="")
+    login.add_argument("--port", type=int, default=0)
+    login.add_argument("--user", default="")
+
+    logout = sub.add_parser("logout", help="forget a mailbox (all of them without an address)")
+    logout.add_argument("address", nargs="?", default="")
+    sub.add_parser("status", help="what is configured")
+
+    sync = sub.add_parser("sync", help="read new headers")
+    sync.add_argument("--months", type=int, default=0, help="how far back to read (default %d)" % DEFAULT_MONTHS)
+    sync.add_argument("--full", action="store_true", help="start over instead of continuing")
+    sync.add_argument("--address", default="", help="only this mailbox")
+
+    sub.add_parser("footprint", help="the aggregated picture, from the cache")
+    sub.add_parser("accounts", help="logins you hold, from the 1Password CLI")
+
+    imp = sub.add_parser("import", help="paste a provider's connections page on stdin")
+    imp.add_argument("provider", help=" | ".join(PROVIDERS_KNOWN))
+    imp.add_argument("--replace", action="store_true", help="forget what was imported before")
+    imp.add_argument("--clipboard", action="store_true", help="take the paste from the clipboard instead of stdin")
+
+    br = sub.add_parser("breaches", help="ask Have I Been Pwned; key in HIBP_API_KEY")
+    br.add_argument("--address", default="", help="check this address instead of the connected mailbox")
+
+    forget = sub.add_parser("forget", help="drop an imported list")
+    forget.add_argument("provider", nargs="?", default="")
+
+    args = parser.parse_args()
+    try:
+        if args.command == "login":
+            run_login(args.address.strip(), args.host.strip(), args.port, args.user.strip())
+        elif args.command == "logout":
+            run_logout(args.address.strip())
+        elif args.command == "status":
+            run_status()
+        elif args.command == "sync":
+            run_sync(args.months, args.full, args.address.strip())
+        elif args.command == "footprint":
+            run_footprint()
+        elif args.command == "accounts":
+            run_accounts()
+        elif args.command == "import":
+            run_import(args.provider, args.replace, args.clipboard)
+        elif args.command == "forget":
+            run_forget(args.provider)
+        elif args.command == "breaches":
+            run_breaches(args.address.strip())
+    except RuntimeError as error:
+        die(str(error))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()
