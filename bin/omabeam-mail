@@ -53,7 +53,17 @@ BREACHES_FILE = CACHE_DIR / "breaches.json"
 HIBP_URL = "https://haveibeenpwned.com/api/v3/breachedaccount/"
 KEYRING_SERVICE = "io.github.gabbe2312.omabeam"
 
-BATCH = 400
+# Memory bounds for what the mail server may send back. Headers are asked for
+# with an IMAP partial range, so a message contributes at most HEADER_BYTES
+# and a batch at most BATCH * HEADER_BYTES (1.6 MB). Bodies are asked for the
+# same way, BODY_BATCH at a time (0.8 MB). A server that ignores the range is
+# cut off by BoundedIMAP below: no single literal above LITERAL_MAX_BYTES and
+# no command above COMMAND_MAX_BYTES is ever read into memory.
+BATCH = 200
+HEADER_BYTES = 8192
+BODY_BATCH = 20
+LITERAL_MAX_BYTES = 65536
+COMMAND_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_MONTHS = 36
 
 
@@ -204,6 +214,35 @@ def guess_provider(address):
     return "imap." + domain, ["INBOX", "Archive"]
 
 
+class _Bounded:
+    """Refuses to read more than it was told to expect. imaplib reads a
+    literal of whatever size the server announces; this checks the size
+    first and drops the connection instead of allocating it."""
+
+    budget = COMMAND_MAX_BYTES
+
+    def begin(self):
+        self.budget = COMMAND_MAX_BYTES
+
+    def read(self, size):
+        if size > LITERAL_MAX_BYTES or size > self.budget:
+            try:
+                self.shutdown()
+            except Exception:
+                pass
+            raise imaplib.IMAP4.abort("the server sent more than was asked for")
+        self.budget -= size
+        return super().read(size)
+
+
+class BoundedIMAP(_Bounded, imaplib.IMAP4):
+    pass
+
+
+class BoundedIMAPS(_Bounded, imaplib.IMAP4_SSL):
+    pass
+
+
 def connect(host, port, user, password):
     # imaplib's default TLS context does not check the server's certificate,
     # which would hand the app password to anyone on the path who can spoof
@@ -212,10 +251,10 @@ def connect(host, port, user, password):
     tls = ssl.create_default_context()
     try:
         if port == 143:
-            client = imaplib.IMAP4(host, port, timeout=30)
+            client = BoundedIMAP(host, port, timeout=30)
             client.starttls(ssl_context=tls)
         else:
-            client = imaplib.IMAP4_SSL(host, port, timeout=30, ssl_context=tls)
+            client = BoundedIMAPS(host, port, timeout=30, ssl_context=tls)
     except OSError as error:
         raise RuntimeError("could not reach %s: %s" % (host, error))
     try:
@@ -588,38 +627,45 @@ def google_apps_in_body(text):
     return found
 
 
-def fetch_bodies(client, uids):
-    """uid -> raw message (first BODY_BYTES) for a small set of uids."""
-    if not uids:
-        return {}
-    ok, data = client.uid("FETCH", ",".join(str(u) for u in uids), "(BODY.PEEK[]<0.%d>)" % BODY_BYTES)
+def bounded_fetch(client, uids, item, limit):
+    """uid -> at most limit bytes, for one bounded FETCH."""
+    if hasattr(client, "begin"):
+        client.begin()
+    try:
+        ok, data = client.uid("FETCH", ",".join(str(u) for u in uids), item)
+    except imaplib.IMAP4.abort as error:
+        raise RuntimeError(str(error))
     if ok != "OK":
-        return {}
+        return None
     out = {}
     for part in data:
         if not isinstance(part, tuple) or len(part) < 2:
             continue
         match = UID_RE.search(part[0])
         if match:
-            out[int(match.group(1))] = part[1]
+            out[int(match.group(1))] = part[1][:limit]
+    return out
+
+
+def fetch_bodies(client, uids):
+    """uid -> raw message (first BODY_BYTES) for a small set of uids."""
+    out = {}
+    uids = list(uids)
+    for i in range(0, len(uids), BODY_BATCH):
+        out.update(bounded_fetch(client, uids[i:i + BODY_BATCH], "(BODY.PEEK[]<0.%d>)" % BODY_BYTES, BODY_BYTES) or {})
     return out
 
 
 def fetch_headers(client, uids):
-    """uid -> raw header bytes for one batch."""
+    """uid -> raw header bytes (first HEADER_BYTES) for one batch."""
     if not uids:
         return {}
-    ok, data = client.uid("FETCH", ",".join(str(u) for u in uids),
-                          "(BODY.PEEK[HEADER.FIELDS (FROM DATE SUBJECT LIST-UNSUBSCRIBE TO DELIVERED-TO)])")
-    if ok != "OK":
+    out = bounded_fetch(
+        client, uids,
+        "(BODY.PEEK[HEADER.FIELDS (FROM DATE SUBJECT LIST-UNSUBSCRIBE TO DELIVERED-TO)]<0.%d>)" % HEADER_BYTES,
+        HEADER_BYTES)
+    if out is None:
         raise RuntimeError("the server would not hand over headers")
-    out = {}
-    for part in data:
-        if not isinstance(part, tuple) or len(part) < 2:
-            continue
-        match = UID_RE.search(part[0])
-        if match:
-            out[int(match.group(1))] = part[1]
     return out
 
 

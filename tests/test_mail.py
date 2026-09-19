@@ -112,5 +112,68 @@ class ReadCapped(unittest.TestCase):
         with self.assertRaises(ValueError):
             mail.read_capped(io.BytesIO(b"x" * 200000), 4096)
 
+
+class FakeClient:
+    """Answers a FETCH the way a server that ignores the byte range would."""
+
+    def __init__(self, header):
+        self.header = header
+        self.items = []
+
+    def uid(self, command, uids, item):
+        self.items.append(item)
+        return "OK", [(b"%d (UID %s BODY[HEADER.FIELDS (FROM)]<0> {%d}" % (i, u.encode(), len(self.header)), self.header)
+                      for i, u in enumerate(uids.split(","), 1)]
+
+
+class BoundedMail(unittest.TestCase):
+    def test_headers_are_asked_for_with_a_byte_range(self):
+        client = FakeClient(b"From: a@example.com\r\n\r\n")
+        mail.fetch_headers(client, [1, 2])
+        self.assertIn("<0.%d>" % mail.HEADER_BYTES, client.items[0])
+
+    def test_oversized_header_is_cut_before_parsing(self):
+        huge = b"From: shop@example.com\r\nSubject: " + b"x" * 500000 + b"\r\n\r\n"
+        got = mail.fetch_headers(FakeClient(huge), [7])
+        self.assertEqual(len(got[7]), mail.HEADER_BYTES)
+        self.assertEqual(email.message_from_bytes(got[7])["From"], "shop@example.com")
+
+    def test_bodies_go_out_in_small_batches(self):
+        client = FakeClient(b"x")
+        mail.fetch_bodies(client, range(1, mail.BODY_BATCH * 2 + 2))
+        self.assertEqual(len(client.items), 3)
+
+    def test_batch_bounds_are_what_the_comment_says(self):
+        self.assertLessEqual(mail.BATCH * mail.HEADER_BYTES, mail.COMMAND_MAX_BYTES)
+        self.assertLessEqual(mail.BODY_BATCH * mail.BODY_BYTES, mail.COMMAND_MAX_BYTES)
+        self.assertLessEqual(mail.BODY_BYTES, mail.LITERAL_MAX_BYTES)
+
+    def test_oversized_literal_is_refused_unread(self):
+        class Base:
+            def __init__(self): self.reads = []
+            def read(self, size): self.reads.append(size); return b""
+            def shutdown(self): self.closed = True
+        class Client(mail._Bounded, Base):
+            pass
+        client = Client()
+        client.begin()
+        client.read(1000)
+        with self.assertRaises(mail.imaplib.IMAP4.abort):
+            client.read(mail.LITERAL_MAX_BYTES + 1)
+        self.assertEqual(client.reads, [1000])
+        self.assertTrue(client.closed)
+
+    def test_many_literals_run_out_of_budget(self):
+        class Base:
+            def read(self, size): return b""
+            def shutdown(self): pass
+        class Client(mail._Bounded, Base):
+            pass
+        client = Client()
+        client.begin()
+        with self.assertRaises(mail.imaplib.IMAP4.abort):
+            for _ in range(mail.COMMAND_MAX_BYTES // mail.LITERAL_MAX_BYTES + 1):
+                client.read(mail.LITERAL_MAX_BYTES)
+
 if __name__ == "__main__":
     unittest.main()

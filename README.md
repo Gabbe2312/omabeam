@@ -294,6 +294,12 @@ the only complete source.
   XposedOrNot or Have I Been Pwned (the address, once a day), Team Cymru
   (remote IP addresses, for owner names; `"owners": false` stops it),
   easylist.to (a list download, weekly). Nothing else.
+- Every answer from the network is read under a byte cap, so a broken or
+  hostile server cannot fill memory. Mail is fetched with IMAP byte ranges:
+  8 KB of headers per message in batches of 200, 40 KB per body in batches
+  of 20, and the connection is dropped if the server sends a literal above
+  64 KB or a single answer above 4 MB. Whois answers stop at 1 MB, tracker
+  lists at 16 MB, breach lookups at 4 MB.
 - No sudo is needed. The optional polkit rule for DNS names is printed for you
   to read and install yourself.
 
