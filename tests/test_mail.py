@@ -101,5 +101,16 @@ class ImportTest(unittest.TestCase):
         self.assertEqual(mail.normalise_name("Zoom Workplace"), "zoomworkplace")
 
 
+
+class ReadCapped(unittest.TestCase):
+    def test_small_body_is_returned_whole(self):
+        import io
+        self.assertEqual(mail.read_capped(io.BytesIO(b"x" * 1000), 4096), b"x" * 1000)
+
+    def test_oversized_body_is_refused(self):
+        import io
+        with self.assertRaises(ValueError):
+            mail.read_capped(io.BytesIO(b"x" * 200000), 4096)
+
 if __name__ == "__main__":
     unittest.main()

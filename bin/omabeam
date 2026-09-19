@@ -59,6 +59,8 @@ LOOKUP_RETRY_SECONDS = 300
 LOOKUP_MAX_TRIES = 3
 CYMRU_HOST = "whois.cymru.com"
 CYMRU_PORT = 43
+CYMRU_MAX_BYTES = 1024 * 1024          # a few hundred bytes per address asked about
+TRACKER_LIST_MAX_BYTES = 16 * 1024 * 1024   # the lists are 2-3 MB each
 
 USERS_RE = re.compile(r'\("([^"]*)",pid=(\d+),fd=\d+\)')
 
@@ -298,6 +300,23 @@ def reverse_dns(ip):
         return ""
 
 
+def read_capped(response, limit):
+    """The whole body, or an error once it passes limit bytes. Timeouts bound
+    the waiting; this bounds the memory."""
+    chunks = []
+    received = 0
+    while True:
+        data = response.read(65536)
+        if not data:
+            break
+        received += len(data)
+        if received > limit:
+            response.close()
+            raise ValueError("response larger than %d bytes" % limit)
+        chunks.append(data)
+    return b"".join(chunks)
+
+
 def cymru_owners(ips):
     """{ip: (owner, country)} from one bulk whois query. Empty on any failure."""
     if not ips:
@@ -307,10 +326,16 @@ def cymru_owners(ips):
         with socket.create_connection((CYMRU_HOST, CYMRU_PORT), timeout=6) as sock:
             sock.sendall(query.encode())
             chunks = []
+            received = 0
             while True:
                 data = sock.recv(65536)
                 if not data:
                     break
+                received += len(data)
+                if received > CYMRU_MAX_BYTES:
+                    # An answer is a line per address. Anything this large is
+                    # not an answer: drop the connection and use none of it.
+                    return {}
                 chunks.append(data)
     except OSError:
         return {}
@@ -502,7 +527,7 @@ def run_trackers(force):
             # The list's host refuses Python's default agent string.
             request = urllib.request.Request(url, headers={"User-Agent": "omabeam/1.0 (+https://github.com/Gabbe2312/omabeam)"})
             with urllib.request.urlopen(request, timeout=30) as response:
-                text = response.read().decode("utf-8", "replace")
+                text = read_capped(response, TRACKER_LIST_MAX_BYTES).decode("utf-8", "replace")
         except Exception as error:
             die("could not fetch %s: %s" % (url, error))
         for line in text.splitlines():

@@ -995,6 +995,24 @@ def run_accounts():
 # ---------------------------------------------------------------- breaches
 
 XON_URL = "https://api.xposedornot.com/v1/breach-analytics?email="
+BREACH_MAX_BYTES = 4 * 1024 * 1024
+
+
+def read_capped(response, limit):
+    """The whole body, or an error once it passes limit bytes. Timeouts bound
+    the waiting; this bounds the memory."""
+    chunks = []
+    received = 0
+    while True:
+        data = response.read(65536)
+        if not data:
+            break
+        received += len(data)
+        if received > limit:
+            response.close()
+            raise ValueError("response larger than %d bytes" % limit)
+        chunks.append(data)
+    return b"".join(chunks)
 
 
 def run_breaches(address):
@@ -1021,7 +1039,7 @@ def check_breaches_xon(address):
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8", "replace"))
+            data = json.loads(read_capped(response, BREACH_MAX_BYTES).decode("utf-8", "replace"))
     except urllib.error.HTTPError as error:
         if error.code == 404:
             data = {}
@@ -1066,7 +1084,7 @@ def check_breaches(address, key):
     breaches = []
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            breaches = json.loads(response.read().decode("utf-8", "replace"))
+            breaches = json.loads(read_capped(response, BREACH_MAX_BYTES).decode("utf-8", "replace"))
     except urllib.error.HTTPError as error:
         if error.code == 404:
             breaches = []
